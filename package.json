@@ -1,0 +1,15 @@
+{
+  "name": "axync-relayer",
+  "version": "0.1.0",
+  "description": "Axync Relayer — submits block proofs to on-chain VerifierContracts",
+  "main": "relayer.js",
+  "scripts": {
+    "start": "node relayer.js"
+  },
+  "keywords": ["axync", "relayer", "zk-proofs", "cross-chain"],
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "ethers": "^6.9.0"
+  }
+}
