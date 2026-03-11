@@ -39,7 +39,7 @@ const VAULT_ABI = [
   "function withdrawalsRoot() view returns (bytes32)",
 ];
 
-// --- Chain Connections ---
+// -- Chain Connections --
 const chains = {};
 
 function initChain(name, rpcUrl, verifierAddr, vaultAddr) {
