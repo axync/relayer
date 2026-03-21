@@ -14,8 +14,4 @@ jobs:
           host: ${{ secrets.DEPLOY_HOST }}
           username: root
           key: ${{ secrets.DEPLOY_KEY }}
-          script: |
-            cd /opt/axync/relayer
-            git pull origin main
-            npm install --production
-            pm2 restart axync-relayer
+          script: /opt/axync/scripts/deploy-relayer.sh

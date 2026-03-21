@@ -275,20 +275,33 @@ async function main() {
     escrowDeployment?.baseSepolia?.escrow || null
   );
 
-  // Verify connections
-  for (const chain of Object.values(chains)) {
-    const sequencer = await chain.verifier.sequencer();
-    const stateRoot = await chain.verifier.stateRoot();
-    console.log(`\n${chain.name}:`);
-    console.log(`  AxyncVerifier: ${await chain.verifier.getAddress()}`);
-    console.log(`  AxyncVault:    ${await chain.vault.getAddress()}`);
-    console.log(`  AxyncEscrow:   ${chain.escrow ? await chain.escrow.getAddress() : "not configured"}`);
-    console.log(`  Sequencer:     ${sequencer}`);
-    console.log(`  StateRoot:     ${stateRoot}`);
-    console.log(`  Wallet:        ${chain.wallet.address}`);
+  // Verify connections (with retry for flaky RPCs)
+  async function retryCall(fn, retries = 5) {
+    for (let i = 0; i < retries; i++) {
+      try { return await fn(); } catch (e) {
+        if (i === retries - 1) throw e;
+        console.log(`  RPC call failed, retrying in ${i + 1}s...`);
+        await new Promise(r => setTimeout(r, (i + 1) * 1000));
+      }
+    }
+  }
 
-    if (sequencer.toLowerCase() !== chain.wallet.address.toLowerCase()) {
-      console.error(`  ⚠️ WARNING: Wallet is not the sequencer!`);
+  for (const chain of Object.values(chains)) {
+    try {
+      const sequencer = await retryCall(() => chain.verifier.sequencer());
+      const stateRoot = await retryCall(() => chain.verifier.stateRoot());
+      console.log(`\n${chain.name}:`);
+      console.log(`  AxyncVerifier: ${await chain.verifier.getAddress()}`);
+      console.log(`  AxyncVault:    ${await chain.vault.getAddress()}`);
+      console.log(`  AxyncEscrow:   ${chain.escrow ? await chain.escrow.getAddress() : "not configured"}`);
+      console.log(`  Sequencer:     ${sequencer}`);
+      console.log(`  StateRoot:     ${stateRoot}`);
+      console.log(`  Wallet:        ${chain.wallet.address}`);
+      if (sequencer.toLowerCase() !== chain.wallet.address.toLowerCase()) {
+        console.error(`  ⚠️ WARNING: Wallet is not the sequencer!`);
+      }
+    } catch (e) {
+      console.log(`\n${chain.name}: startup check failed (${e.shortMessage || e.message}), will retry on first block`);
     }
   }
 
