@@ -3,39 +3,30 @@
  *
  * Polls the sequencer API for new blocks and submits their proofs
  * to AxyncVerifier contracts on both Sepolia and Base Sepolia.
- * Also updates withdrawalsRoot on AxyncVault and AxyncEscrow
- * when blocks contain withdrawals.
- *
- * Usage: node relayer.js
+ * Also updates withdrawalsRoot on AxyncVault and AxyncEscrow.
  */
 
 const { ethers } = require("ethers");
 const fs = require("fs");
 require("dotenv").config();
 
-// --- Configuration ---
 const API_URL = process.env.API_URL || "http://localhost:8080";
-const POLL_INTERVAL = parseInt(process.env.RELAYER_POLL_INTERVAL || "5000"); // ms
+const POLL_INTERVAL = parseInt(process.env.RELAYER_POLL_INTERVAL || "15000");
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 
-// Load deployment addresses
 let deployment;
 try {
   deployment = JSON.parse(fs.readFileSync("deployment.json", "utf8"));
-} catch (e) {
-  console.error("❌ deployment.json not found. Copy it from contracts/deployment-mvp.json");
+} catch {
+  console.error("❌ deployment.json not found");
   process.exit(1);
 }
 
-// Load escrow deployment addresses (optional — relayer works without escrow)
 let escrowDeployment = null;
 try {
   escrowDeployment = JSON.parse(fs.readFileSync("deployment-escrow.json", "utf8"));
-} catch {
-  console.log("ℹ️  deployment-escrow.json not found, escrow withdrawalsRoot updates disabled");
-}
+} catch {}
 
-// ABI fragments (only functions we need)
 const VERIFIER_ABI = [
   "function submitBlockProof(uint256 blockId, bytes32 prevStateRoot, bytes32 newStateRoot, bytes32 withdrawalsRoot, bytes calldata proof) external",
   "function stateRoot() view returns (bytes32)",
@@ -44,29 +35,33 @@ const VERIFIER_ABI = [
 ];
 
 const VAULT_ABI = [
-  "function updateWithdrawalsRoot(bytes32 newWithdrawalsRoot) external",
+  "function updateWithdrawalsRoot(bytes32) external",
   "function withdrawalsRoot() view returns (bytes32)",
 ];
 
 const ESCROW_ABI = [
-  "function updateWithdrawalsRoot(bytes32 _withdrawalsRoot) external",
+  "function updateWithdrawalsRoot(bytes32) external",
   "function withdrawalsRoot() view returns (bytes32)",
 ];
 
-// -- Chain Connections --
+const ZERO_ROOT = "0x" + "0".repeat(64);
+
+// --- Chain setup with static network (avoids eth_chainId auto-detection failures) ---
 const chains = {};
 
-function initChain(name, rpcUrl, verifierAddr, vaultAddr, escrowAddr) {
-  const provider = new ethers.JsonRpcProvider(rpcUrl);
+function initChain(name, rpcUrl, chainId, verifierAddr, vaultAddr, escrowAddr) {
+  const network = new ethers.Network(name, chainId);
+  const provider = new ethers.JsonRpcProvider(rpcUrl, network, { staticNetwork: network });
   const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
-  const verifier = new ethers.Contract(verifierAddr, VERIFIER_ABI, wallet);
-  const vault = new ethers.Contract(vaultAddr, VAULT_ABI, wallet);
-  const escrow = escrowAddr
-    ? new ethers.Contract(escrowAddr, ESCROW_ABI, wallet)
-    : null;
 
-  chains[name] = { provider, wallet, verifier, vault, escrow, name };
-  return chains[name];
+  chains[name] = {
+    name,
+    provider,
+    wallet,
+    verifier: new ethers.Contract(verifierAddr, VERIFIER_ABI, wallet),
+    vault: new ethers.Contract(vaultAddr, VAULT_ABI, wallet),
+    escrow: escrowAddr ? new ethers.Contract(escrowAddr, ESCROW_ABI, wallet) : null,
+  };
 }
 
 // --- State ---
@@ -75,9 +70,8 @@ const STATE_FILE = "relayer-state.json";
 
 function loadState() {
   try {
-    const data = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-    lastSubmittedBlockId = data.lastSubmittedBlockId || 0;
-    console.log(`📂 Loaded state: lastSubmittedBlockId = ${lastSubmittedBlockId}`);
+    lastSubmittedBlockId = JSON.parse(fs.readFileSync(STATE_FILE, "utf8")).lastSubmittedBlockId || 0;
+    console.log(`📂 State: lastSubmittedBlockId = ${lastSubmittedBlockId}`);
   } catch {
     console.log("📂 No saved state, starting from block 0");
   }
@@ -87,236 +81,174 @@ function saveState() {
   fs.writeFileSync(STATE_FILE, JSON.stringify({ lastSubmittedBlockId }, null, 2));
 }
 
-// --- API Helpers ---
+// --- API ---
 async function fetchCurrentBlockId() {
   const resp = await fetch(`${API_URL}/api/v1/current_block`);
-  if (!resp.ok) throw new Error(`API error: ${resp.status}`);
-  const data = await resp.json();
-  return data.current_block_id;
+  if (!resp.ok) throw new Error(`API ${resp.status}`);
+  return (await resp.json()).current_block_id;
 }
 
 async function fetchBlock(blockId) {
   const resp = await fetch(`${API_URL}/api/v1/block/${blockId}`);
-  if (!resp.ok) {
-    if (resp.status === 404) return null;
-    throw new Error(`API error fetching block ${blockId}: ${resp.status}`);
-  }
+  if (!resp.ok) return null;
   return await resp.json();
 }
 
-// --- Gas options with bumped fees for L2s ---
+// --- Gas ---
 async function getGasOpts(provider, gasLimit = 500000) {
-  const feeData = await provider.getFeeData();
+  const fee = await provider.getFeeData();
   const opts = { gasLimit };
-  if (feeData.maxFeePerGas) {
-    opts.maxFeePerGas = feeData.maxFeePerGas * 3n;
-    opts.maxPriorityFeePerGas = (feeData.maxPriorityFeePerGas || 1000000n) * 3n;
+  if (fee.maxFeePerGas) {
+    opts.maxFeePerGas = fee.maxFeePerGas * 3n;
+    opts.maxPriorityFeePerGas = (fee.maxPriorityFeePerGas || 1000000n) * 3n;
   }
   return opts;
 }
 
-// --- Submit block proof to a single chain ---
-async function submitBlockProofToChain(chain, blockId, prevStateRoot, newStateRoot, withdrawalsRoot, proof) {
+// --- Submit to one chain ---
+async function submitToChain(chain, blockId, prevStateRoot, newStateRoot, withdrawalsRoot, proof) {
   try {
-    // Check if already processed
     const isProcessed = await chain.verifier.processedBlocks(blockId);
     if (isProcessed) {
-      console.log(`  [${chain.name}] Block ${blockId} already processed, skipping`);
+      console.log(`  [${chain.name}] Block ${blockId} already processed`);
       return true;
     }
 
-    // Check stateRoot matches
-    const currentStateRoot = await chain.verifier.stateRoot();
-    if (currentStateRoot !== prevStateRoot) {
-      console.log(`  [${chain.name}] ⚠️ State root mismatch!`);
-      console.log(`    Contract: ${currentStateRoot}`);
-      console.log(`    Expected: ${prevStateRoot}`);
+    const onChainRoot = await chain.verifier.stateRoot();
+    if (onChainRoot !== prevStateRoot) {
+      console.log(`  [${chain.name}] ⚠️ stateRoot mismatch: on-chain=${onChainRoot.slice(0, 18)}... expected=${prevStateRoot.slice(0, 18)}...`);
       return false;
     }
 
-    console.log(`  [${chain.name}] Submitting block ${blockId} proof...`);
-    const gasOpts = await getGasOpts(chain.provider, 500000);
+    // Submit block proof
+    console.log(`  [${chain.name}] Submitting block ${blockId}...`);
+    const gas = await getGasOpts(chain.provider);
     const nonce = await chain.provider.getTransactionCount(chain.wallet.address);
-    const tx = await chain.verifier.submitBlockProof(
-      blockId,
-      prevStateRoot,
-      newStateRoot,
-      withdrawalsRoot,
-      proof,
-      { ...gasOpts, nonce }
-    );
+    const tx = await chain.verifier.submitBlockProof(blockId, prevStateRoot, newStateRoot, withdrawalsRoot, proof, { ...gas, nonce });
     const receipt = await tx.wait();
     console.log(`  [${chain.name}] ✅ Block ${blockId} submitted (gas: ${receipt.gasUsed})`);
 
-    // Update withdrawals root if non-zero
-    const ZERO = "0x" + "0".repeat(64);
-    if (withdrawalsRoot !== ZERO) {
-      // Wait briefly and get fresh nonce to avoid "replacement fee too low"
-      await new Promise(r => setTimeout(r, 2000));
-
-      // Update AxyncVault withdrawalsRoot
-      const wdGasOpts = await getGasOpts(chain.provider, 100000);
-      const wdNonce = await chain.provider.getTransactionCount(chain.wallet.address);
-      console.log(`  [${chain.name}] Updating AxyncVault withdrawalsRoot (nonce ${wdNonce})...`);
-      const wdTx = await chain.vault.updateWithdrawalsRoot(withdrawalsRoot, { ...wdGasOpts, nonce: wdNonce });
-      await wdTx.wait();
-      console.log(`  [${chain.name}] ✅ AxyncVault withdrawalsRoot updated`);
-
-      // Update AxyncEscrow withdrawalsRoot (if escrow is deployed on this chain)
-      if (chain.escrow) {
-        await new Promise(r => setTimeout(r, 2000));
-        const escrowGasOpts = await getGasOpts(chain.provider, 100000);
-        const escrowNonce = await chain.provider.getTransactionCount(chain.wallet.address);
-        console.log(`  [${chain.name}] Updating AxyncEscrow withdrawalsRoot (nonce ${escrowNonce})...`);
-        const escrowTx = await chain.escrow.updateWithdrawalsRoot(withdrawalsRoot, { ...escrowGasOpts, nonce: escrowNonce });
-        await escrowTx.wait();
-        console.log(`  [${chain.name}] ✅ AxyncEscrow withdrawalsRoot updated`);
-      }
+    // Update withdrawalsRoot on Vault and Escrow
+    if (withdrawalsRoot !== ZERO_ROOT) {
+      await updateWithdrawalsRoot(chain, withdrawalsRoot);
     }
 
     return true;
   } catch (err) {
-    console.error(`  [${chain.name}] ❌ Error: ${err.message}`);
+    console.error(`  [${chain.name}] ❌ ${err.shortMessage || err.message}`);
     return false;
   }
 }
 
-// --- Main Loop ---
+async function updateWithdrawalsRoot(chain, root) {
+  // Vault
+  try {
+    await new Promise(r => setTimeout(r, 2000));
+    const gas = await getGasOpts(chain.provider, 100000);
+    const nonce = await chain.provider.getTransactionCount(chain.wallet.address);
+    const tx = await chain.vault.updateWithdrawalsRoot(root, { ...gas, nonce });
+    await tx.wait();
+    console.log(`  [${chain.name}] ✅ Vault withdrawalsRoot updated`);
+  } catch (err) {
+    console.error(`  [${chain.name}] ❌ Vault update failed: ${err.shortMessage || err.message}`);
+  }
+
+  // Escrow
+  if (chain.escrow) {
+    try {
+      await new Promise(r => setTimeout(r, 2000));
+      const gas = await getGasOpts(chain.provider, 100000);
+      const nonce = await chain.provider.getTransactionCount(chain.wallet.address);
+      const tx = await chain.escrow.updateWithdrawalsRoot(root, { ...gas, nonce });
+      await tx.wait();
+      console.log(`  [${chain.name}] ✅ Escrow withdrawalsRoot updated`);
+    } catch (err) {
+      console.error(`  [${chain.name}] ❌ Escrow update failed: ${err.shortMessage || err.message}`);
+    }
+  }
+}
+
+// --- Main loop ---
 async function processNewBlocks() {
   try {
     const currentBlockId = await fetchCurrentBlockId();
+    if (currentBlockId <= lastSubmittedBlockId + 1) return;
 
-    if (currentBlockId <= lastSubmittedBlockId + 1) {
-      return; // No new blocks
-    }
+    console.log(`\n🔄 Blocks ${lastSubmittedBlockId + 1} → ${currentBlockId - 1}`);
 
-    console.log(`\n🔄 New blocks detected: ${lastSubmittedBlockId + 1} → ${currentBlockId - 1}`);
-
-    // Track prevStateRoot across blocks
-    // For the very first block, prevStateRoot = bytes32(0)
-    let prevStateRoot = "0x" + "0".repeat(64);
-
-    // If we've already submitted blocks, get the last known state root
+    let prevStateRoot = ZERO_ROOT;
     if (lastSubmittedBlockId > 0) {
-      const lastBlock = await fetchBlock(lastSubmittedBlockId);
-      if (lastBlock) {
-        prevStateRoot = lastBlock.state_root;
-      }
+      const last = await fetchBlock(lastSubmittedBlockId);
+      if (last) prevStateRoot = last.state_root;
     }
 
-    for (let blockId = lastSubmittedBlockId + 1; blockId < currentBlockId; blockId++) {
-      const block = await fetchBlock(blockId);
-      if (!block) {
-        console.log(`  Block ${blockId} not found in storage, skipping`);
-        continue;
-      }
+    for (let bid = lastSubmittedBlockId + 1; bid < currentBlockId; bid++) {
+      const block = await fetchBlock(bid);
+      if (!block) { console.log(`  Block ${bid} not found`); continue; }
 
-      console.log(`\n📦 Block ${blockId}: ${block.transaction_count} txs`);
-      console.log(`  state_root:       ${block.state_root}`);
-      console.log(`  withdrawals_root: ${block.withdrawals_root}`);
-      console.log(`  proof length:     ${block.block_proof ? (block.block_proof.length - 2) / 2 : 0} bytes`);
+      console.log(`\n📦 Block ${bid}: ${block.transaction_count} txs, wr=${block.withdrawals_root.slice(0, 18)}...`);
 
-      // Prepare proof - ensure it's non-empty for placeholder verification
       let proof = block.block_proof;
-      if (!proof || proof === "0x" || proof === "0x00") {
-        proof = "0x" + "ab".repeat(32);
-      }
+      if (!proof || proof === "0x" || proof === "0x00") proof = "0x" + "ab".repeat(32);
 
-      const newStateRoot = block.state_root;
-      const withdrawalsRoot = block.withdrawals_root;
-
-      // Submit to all chains
-      let allSuccess = true;
+      let ok = true;
       for (const chain of Object.values(chains)) {
-        const success = await submitBlockProofToChain(
-          chain,
-          blockId,
-          prevStateRoot,
-          newStateRoot,
-          withdrawalsRoot,
-          proof
-        );
-        if (!success) allSuccess = false;
+        if (!(await submitToChain(chain, bid, prevStateRoot, block.state_root, block.withdrawals_root, proof))) ok = false;
       }
 
-      if (allSuccess) {
-        lastSubmittedBlockId = blockId;
-        prevStateRoot = newStateRoot;
+      if (ok) {
+        lastSubmittedBlockId = bid;
+        prevStateRoot = block.state_root;
         saveState();
       } else {
-        console.log(`  ⚠️ Block ${blockId} failed on some chains, will retry`);
-        break; // Stop and retry on next poll
+        console.log(`  ⚠️ Block ${bid} failed, will retry`);
+        break;
       }
     }
   } catch (err) {
-    console.error(`Error in processNewBlocks: ${err.message}`);
+    console.error(`Poll error: ${err.message}`);
   }
 }
 
-// --- Init & Run ---
+// --- Start ---
 async function main() {
-  console.log("🚀 Axync Relayer Starting...\n");
-  console.log(`API URL: ${API_URL}`);
-  console.log(`Poll interval: ${POLL_INTERVAL}ms`);
+  console.log("🚀 Axync Relayer\n");
+  console.log(`API: ${API_URL}`);
+  console.log(`Poll: ${POLL_INTERVAL / 1000}s`);
 
-  // Init chains
-  initChain(
-    "Sepolia",
-    process.env.SEPOLIA_RPC || "https://ethereum-sepolia-rpc.publicnode.com",
-    deployment.sepolia.verifier,
-    deployment.sepolia.vault,
+  initChain("Sepolia",
+    process.env.SEPOLIA_RPC || "https://sepolia.drpc.org",
+    11155111,
+    deployment.sepolia.verifier, deployment.sepolia.vault,
     escrowDeployment?.sepolia?.escrow || null
   );
-  initChain(
-    "Base Sepolia",
-    process.env.BASE_SEPOLIA_RPC || "https://sepolia.base.org",
-    deployment.baseSepolia.verifier,
-    deployment.baseSepolia.vault,
+
+  initChain("Base Sepolia",
+    process.env.BASE_SEPOLIA_RPC || "https://base-sepolia-rpc.publicnode.com",
+    84532,
+    deployment.baseSepolia.verifier, deployment.baseSepolia.vault,
     escrowDeployment?.baseSepolia?.escrow || null
   );
 
-  // Verify connections (with retry for flaky RPCs)
-  async function retryCall(fn, retries = 5) {
-    for (let i = 0; i < retries; i++) {
-      try { return await fn(); } catch (e) {
-        if (i === retries - 1) throw e;
-        console.log(`  RPC call failed, retrying in ${i + 1}s...`);
-        await new Promise(r => setTimeout(r, (i + 1) * 1000));
-      }
-    }
-  }
-
-  for (const chain of Object.values(chains)) {
-    try {
-      const sequencer = await retryCall(() => chain.verifier.sequencer());
-      const stateRoot = await retryCall(() => chain.verifier.stateRoot());
-      console.log(`\n${chain.name}:`);
-      console.log(`  AxyncVerifier: ${await chain.verifier.getAddress()}`);
-      console.log(`  AxyncVault:    ${await chain.vault.getAddress()}`);
-      console.log(`  AxyncEscrow:   ${chain.escrow ? await chain.escrow.getAddress() : "not configured"}`);
-      console.log(`  Sequencer:     ${sequencer}`);
-      console.log(`  StateRoot:     ${stateRoot}`);
-      console.log(`  Wallet:        ${chain.wallet.address}`);
-      if (sequencer.toLowerCase() !== chain.wallet.address.toLowerCase()) {
-        console.error(`  ⚠️ WARNING: Wallet is not the sequencer!`);
-      }
-    } catch (e) {
-      console.log(`\n${chain.name}: startup check failed (${e.shortMessage || e.message}), will retry on first block`);
-    }
+  // Print config
+  for (const c of Object.values(chains)) {
+    console.log(`\n${c.name}:`);
+    console.log(`  Verifier: ${await c.verifier.getAddress()}`);
+    console.log(`  Vault:    ${await c.vault.getAddress()}`);
+    console.log(`  Escrow:   ${c.escrow ? await c.escrow.getAddress() : "none"}`);
+    console.log(`  Wallet:   ${c.wallet.address}`);
   }
 
   loadState();
+  console.log(`\n✅ Running\n`);
 
-  console.log(`\n✅ Relayer running. Polling every ${POLL_INTERVAL / 1000}s...\n`);
-
-  // Main loop
   while (true) {
     await processNewBlocks();
-    await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL));
+    await new Promise(r => setTimeout(r, POLL_INTERVAL));
   }
 }
 
-main().catch((err) => {
-  console.error("Fatal error:", err);
+main().catch(err => {
+  console.error("Fatal:", err.message);
   process.exit(1);
 });
