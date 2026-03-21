@@ -1,9 +1,10 @@
 /**
- * Axync Relayer - Submits block proofs to on-chain VerifierContracts
+ * Axync Relayer - Submits block proofs to on-chain AxyncVerifier contracts
  *
  * Polls the sequencer API for new blocks and submits their proofs
- * to VerifierContracts on both Sepolia and Base Sepolia.
- * Also updates AxyncVault.withdrawalsRoot when blocks contain withdrawals.
+ * to AxyncVerifier contracts on both Sepolia and Base Sepolia.
+ * Also updates withdrawalsRoot on AxyncVault and AxyncEscrow
+ * when blocks contain withdrawals.
  *
  * Usage: node relayer.js
  */
@@ -26,6 +27,14 @@ try {
   process.exit(1);
 }
 
+// Load escrow deployment addresses (optional — relayer works without escrow)
+let escrowDeployment = null;
+try {
+  escrowDeployment = JSON.parse(fs.readFileSync("deployment-escrow.json", "utf8"));
+} catch {
+  console.log("ℹ️  deployment-escrow.json not found, escrow withdrawalsRoot updates disabled");
+}
+
 // ABI fragments (only functions we need)
 const VERIFIER_ABI = [
   "function submitBlockProof(uint256 blockId, bytes32 prevStateRoot, bytes32 newStateRoot, bytes32 withdrawalsRoot, bytes calldata proof) external",
@@ -39,16 +48,24 @@ const VAULT_ABI = [
   "function withdrawalsRoot() view returns (bytes32)",
 ];
 
+const ESCROW_ABI = [
+  "function updateWithdrawalsRoot(bytes32 _withdrawalsRoot) external",
+  "function withdrawalsRoot() view returns (bytes32)",
+];
+
 // -- Chain Connections --
 const chains = {};
 
-function initChain(name, rpcUrl, verifierAddr, vaultAddr) {
+function initChain(name, rpcUrl, verifierAddr, vaultAddr, escrowAddr) {
   const provider = new ethers.JsonRpcProvider(rpcUrl);
   const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
   const verifier = new ethers.Contract(verifierAddr, VERIFIER_ABI, wallet);
   const vault = new ethers.Contract(vaultAddr, VAULT_ABI, wallet);
+  const escrow = escrowAddr
+    ? new ethers.Contract(escrowAddr, ESCROW_ABI, wallet)
+    : null;
 
-  chains[name] = { provider, wallet, verifier, vault, name };
+  chains[name] = { provider, wallet, verifier, vault, escrow, name };
   return chains[name];
 }
 
@@ -136,12 +153,25 @@ async function submitBlockProofToChain(chain, blockId, prevStateRoot, newStateRo
     if (withdrawalsRoot !== ZERO) {
       // Wait briefly and get fresh nonce to avoid "replacement fee too low"
       await new Promise(r => setTimeout(r, 2000));
+
+      // Update AxyncVault withdrawalsRoot
       const wdGasOpts = await getGasOpts(chain.provider, 100000);
       const wdNonce = await chain.provider.getTransactionCount(chain.wallet.address);
-      console.log(`  [${chain.name}] Updating withdrawalsRoot (nonce ${wdNonce})...`);
+      console.log(`  [${chain.name}] Updating AxyncVault withdrawalsRoot (nonce ${wdNonce})...`);
       const wdTx = await chain.vault.updateWithdrawalsRoot(withdrawalsRoot, { ...wdGasOpts, nonce: wdNonce });
       await wdTx.wait();
-      console.log(`  [${chain.name}] ✅ WithdrawalsRoot updated`);
+      console.log(`  [${chain.name}] ✅ AxyncVault withdrawalsRoot updated`);
+
+      // Update AxyncEscrow withdrawalsRoot (if escrow is deployed on this chain)
+      if (chain.escrow) {
+        await new Promise(r => setTimeout(r, 2000));
+        const escrowGasOpts = await getGasOpts(chain.provider, 100000);
+        const escrowNonce = await chain.provider.getTransactionCount(chain.wallet.address);
+        console.log(`  [${chain.name}] Updating AxyncEscrow withdrawalsRoot (nonce ${escrowNonce})...`);
+        const escrowTx = await chain.escrow.updateWithdrawalsRoot(withdrawalsRoot, { ...escrowGasOpts, nonce: escrowNonce });
+        await escrowTx.wait();
+        console.log(`  [${chain.name}] ✅ AxyncEscrow withdrawalsRoot updated`);
+      }
     }
 
     return true;
@@ -234,13 +264,15 @@ async function main() {
     "Sepolia",
     process.env.SEPOLIA_RPC || "https://ethereum-sepolia-rpc.publicnode.com",
     deployment.sepolia.verifier,
-    deployment.sepolia.vault
+    deployment.sepolia.vault,
+    escrowDeployment?.sepolia?.escrow || null
   );
   initChain(
     "Base Sepolia",
     process.env.BASE_SEPOLIA_RPC || "https://sepolia.base.org",
     deployment.baseSepolia.verifier,
-    deployment.baseSepolia.vault
+    deployment.baseSepolia.vault,
+    escrowDeployment?.baseSepolia?.escrow || null
   );
 
   // Verify connections
@@ -248,9 +280,12 @@ async function main() {
     const sequencer = await chain.verifier.sequencer();
     const stateRoot = await chain.verifier.stateRoot();
     console.log(`\n${chain.name}:`);
-    console.log(`  Sequencer: ${sequencer}`);
-    console.log(`  StateRoot: ${stateRoot}`);
-    console.log(`  Wallet:    ${chain.wallet.address}`);
+    console.log(`  AxyncVerifier: ${await chain.verifier.getAddress()}`);
+    console.log(`  AxyncVault:    ${await chain.vault.getAddress()}`);
+    console.log(`  AxyncEscrow:   ${chain.escrow ? await chain.escrow.getAddress() : "not configured"}`);
+    console.log(`  Sequencer:     ${sequencer}`);
+    console.log(`  StateRoot:     ${stateRoot}`);
+    console.log(`  Wallet:        ${chain.wallet.address}`);
 
     if (sequencer.toLowerCase() !== chain.wallet.address.toLowerCase()) {
       console.error(`  ⚠️ WARNING: Wallet is not the sequencer!`);
