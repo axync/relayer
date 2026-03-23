@@ -14,4 +14,10 @@ jobs:
           host: ${{ secrets.DEPLOY_HOST }}
           username: root
           key: ${{ secrets.DEPLOY_KEY }}
-          script: /opt/axync/scripts/deploy-relayer.sh
+          script: |
+            cd /opt/axync/relayer
+            git fetch origin main
+            git reset --hard origin/main
+            docker build -t axync/relayer:latest .
+            cd /opt/axync
+            docker compose up -d relayer

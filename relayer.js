@@ -18,14 +18,30 @@ let deployment;
 try {
   deployment = JSON.parse(fs.readFileSync("deployment.json", "utf8"));
 } catch {
-  console.error("❌ deployment.json not found");
-  process.exit(1);
+  // Fallback to env vars (for Docker)
+  if (process.env.SEPOLIA_VERIFIER && process.env.BASE_VERIFIER) {
+    deployment = {
+      sepolia: { verifier: process.env.SEPOLIA_VERIFIER, vault: process.env.SEPOLIA_VAULT },
+      baseSepolia: { verifier: process.env.BASE_VERIFIER, vault: process.env.BASE_VAULT },
+    };
+  } else {
+    console.error("❌ deployment.json not found and no env vars set");
+    process.exit(1);
+  }
 }
 
 let escrowDeployment = null;
 try {
   escrowDeployment = JSON.parse(fs.readFileSync("deployment-escrow.json", "utf8"));
-} catch {}
+} catch {
+  // Fallback to env vars
+  if (process.env.SEPOLIA_ESCROW) {
+    escrowDeployment = {
+      sepolia: { escrow: process.env.SEPOLIA_ESCROW },
+      baseSepolia: { escrow: process.env.BASE_ESCROW },
+    };
+  }
+}
 
 const VERIFIER_ABI = [
   "function submitBlockProof(uint256 blockId, bytes32 prevStateRoot, bytes32 newStateRoot, bytes32 withdrawalsRoot, bytes calldata proof) external",

@@ -2,5 +2,5 @@ node_modules/
 .git/
 *.md
 .env
-deployment*.json
 relayer-state.json
+deployment*.json
